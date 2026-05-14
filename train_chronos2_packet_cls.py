@@ -46,17 +46,22 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 
-# PAIRS empty means auto-scan ./csv_data and ./labels.
-PAIRS: List[Tuple[str, str]] = []
+# Manual split pairs. Empty means auto-scan TRAIN/VAL/TEST data folders and
+# match every traffic CSV to one label CSV under LABEL_DIR.
+TRAIN_PAIRS: List[Tuple[str, str]] = []
+VAL_PAIRS: List[Tuple[str, str]] = []
+TEST_PAIRS: List[Tuple[str, str]] = []
 # Example manual configuration:
-# PAIRS = [
-#     ("./csv_data/N3_Facebook_129_0909_100526.csv", "./labels/N3_Facebook_129_20250909_100526.csv"),
+# TRAIN_PAIRS = [
+#     ("./train_csv_data/N3_Facebook_129_0909_100526.csv", "./labels/N3_Facebook_129_20250909_100526.csv"),
 # ]
 
 
 @dataclass
 class CFG:
-    DATA_DIR: str = "./csv_data"
+    TRAIN_DATA_DIR: str = "./train_csv_data"
+    VAL_DATA_DIR: str = "./val_csv_data"
+    TEST_DATA_DIR: str = "./test_csv_data"
     LABEL_DIR: str = "./labels"
     MODEL_PATH: str = "./chronos_2_weights"
 
@@ -439,34 +444,67 @@ def fit_transform_scaler(splits: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, D
     return splits, scaler
 
 
-def scan_pairs(cfg: CFG) -> List[Tuple[str, str]]:
-    if PAIRS:
-        logging.info("Using manually configured PAIRS=%d", len(PAIRS))
-        return PAIRS
-    traffic_files = sorted(Path(cfg.DATA_DIR).glob("*.csv"))
-    label_files = sorted(Path(cfg.LABEL_DIR).glob("*.csv"))
-    logging.info("Scanned traffic files: %d", len(traffic_files))
-    logging.info("Scanned label files: %d", len(label_files))
+def expected_label_name(traffic_name: str) -> Optional[str]:
+    pat = re.compile(r"^(?P<prefix>.+)_(?P<mmdd>\d{4})_(?P<hms>\d{6})\.csv$")
+    m = pat.match(traffic_name)
+    if not m:
+        return None
+    return f"{m.group('prefix')}_2025{m.group('mmdd')}_{m.group('hms')}.csv"
+
+
+def scan_pairs_for_split(
+    split_name: str,
+    data_dir: str,
+    label_dir: str,
+    manual_pairs: Sequence[Tuple[str, str]],
+) -> List[Tuple[str, str]]:
+    if manual_pairs:
+        logging.info("Using manually configured %s pairs=%d", split_name, len(manual_pairs))
+        return list(manual_pairs)
+
+    traffic_root = Path(data_dir)
+    label_root = Path(label_dir)
+    if not traffic_root.exists():
+        raise FileNotFoundError(
+            f"{split_name} data directory does not exist: {data_dir}. "
+            "Set CFG.TRAIN_DATA_DIR / CFG.VAL_DATA_DIR / CFG.TEST_DATA_DIR or pass CLI args."
+        )
+    if not label_root.exists():
+        raise FileNotFoundError(f"Label directory does not exist: {label_dir}")
+
+    traffic_files = sorted(traffic_root.glob("*.csv"))
+    label_files = sorted(label_root.glob("*.csv"))
+    logging.info("[%s] scanned traffic files: %d from %s", split_name, len(traffic_files), data_dir)
+    logging.info("[%s] scanned label files: %d from %s", split_name, len(label_files), label_dir)
     label_map = {p.name: p for p in label_files}
     pairs: List[Tuple[str, str]] = []
-    pat = re.compile(r"^(?P<prefix>.+)_(?P<mmdd>\d{4})_(?P<hms>\d{6})\.csv$")
     for tf in traffic_files:
-        m = pat.match(tf.name)
-        if not m:
+        expected = expected_label_name(tf.name)
+        if expected is None:
             logging.warning("Skip unmatched traffic filename format: %s", tf.name)
             continue
-        expected = f"{m.group('prefix')}_2025{m.group('mmdd')}_{m.group('hms')}.csv"
         lf = label_map.get(expected)
         if lf is None:
             logging.warning("No label match for %s; expected %s", tf.name, expected)
             continue
         pairs.append((str(tf), str(lf)))
-    logging.info("Matched traffic-label pairs: %d", len(pairs))
+    logging.info("[%s] matched traffic-label pairs: %d", split_name, len(pairs))
     for i, (t, l) in enumerate(pairs):
-        logging.info("pair[%d]: %s <-> %s", i, t, l)
+        logging.info("[%s] pair[%d]: %s <-> %s", split_name, i, t, l)
     if not pairs:
-        raise RuntimeError("No traffic-label pairs matched. Fill PAIRS manually at the top of the script.")
+        raise RuntimeError(
+            f"No {split_name} traffic-label pairs matched. "
+            "Check folder paths, filenames, or fill TRAIN_PAIRS/VAL_PAIRS/TEST_PAIRS manually."
+        )
     return pairs
+
+
+def scan_split_pairs(cfg: CFG) -> Dict[str, List[Tuple[str, str]]]:
+    return {
+        "train": scan_pairs_for_split("train", cfg.TRAIN_DATA_DIR, cfg.LABEL_DIR, TRAIN_PAIRS),
+        "val": scan_pairs_for_split("val", cfg.VAL_DATA_DIR, cfg.LABEL_DIR, VAL_PAIRS),
+        "test": scan_pairs_for_split("test", cfg.TEST_DATA_DIR, cfg.LABEL_DIR, TEST_PAIRS),
+    }
 
 
 def log_split_stats(splits: Dict[str, Dict[str, Any]]) -> None:
@@ -729,22 +767,32 @@ def save_checkpoint(path: str, model: nn.Module, cfg: CFG, scaler: StandardScale
     logging.info("Saved best model to %s", path)
 
 
-def prepare_data(cfg: CFG, pairs: Sequence[Tuple[str, str]]) -> Tuple[Dict[str, Dict[str, Any]], StandardScaler]:
-    parts = []
-    for pair_id, (traffic_path, label_path) in enumerate(pairs):
-        logging.info("Loading pair_id=%d traffic=%s label=%s", pair_id, traffic_path, label_path)
-        data = build_samples_for_pair(traffic_path, label_path, pair_id, cfg)
-        parts.append(split_pair(data))
-    splits = concat_splits(parts)
+def concat_split_samples(items: List[Dict[str, Any]], split_name: str) -> Dict[str, Any]:
+    if not items:
+        raise RuntimeError(f"No samples were built for split={split_name}")
+    keys = ["X", "mask", "y", "window_start", "window_end", "pair_id", "traffic_file", "label_file"]
+    return {k: np.concatenate([item[k] for item in items], axis=0) for k in keys}
+
+
+def prepare_data(cfg: CFG, split_pairs: Dict[str, Sequence[Tuple[str, str]]]) -> Tuple[Dict[str, Dict[str, Any]], StandardScaler]:
+    splits: Dict[str, Dict[str, Any]] = {}
+    global_pair_id = 0
+    for split in ("train", "val", "test"):
+        built_items: List[Dict[str, Any]] = []
+        for traffic_path, label_path in split_pairs[split]:
+            logging.info("Loading split=%s pair_id=%d traffic=%s label=%s", split, global_pair_id, traffic_path, label_path)
+            built_items.append(build_samples_for_pair(traffic_path, label_path, global_pair_id, cfg))
+            global_pair_id += 1
+        splits[split] = concat_split_samples(built_items, split)
     log_split_stats(splits)
     return fit_transform_scaler(splits)
 
 
-def run_experiment(cfg: CFG, pairs: Sequence[Tuple[str, str]], dry_run_data: bool = False) -> Dict[str, Any]:
+def run_experiment(cfg: CFG, split_pairs: Dict[str, Sequence[Tuple[str, str]]], dry_run_data: bool = False) -> Dict[str, Any]:
     set_seed(cfg.SEED)
     logging.info("Device=%s", cfg.DEVICE)
     logging.info("USE_VAL_THRESHOLD_SEARCH=%s FIXED_THRESHOLD=%.3f", cfg.USE_VAL_THRESHOLD_SEARCH, cfg.FIXED_THRESHOLD)
-    splits, scaler_obj = prepare_data(cfg, pairs)
+    splits, scaler_obj = prepare_data(cfg, split_pairs)
     if dry_run_data:
         logging.info("Dry-run data completed.")
         return {"status": "dry_run_data"}
@@ -842,7 +890,7 @@ def print_sweep_table(results: List[Dict[str, Any]], save_path: str) -> None:
     logging.info("Saved sweep results to %s", save_path)
 
 
-def run_sweep(base_cfg: CFG, pairs: Sequence[Tuple[str, str]]) -> None:
+def run_sweep(base_cfg: CFG, split_pairs: Dict[str, Sequence[Tuple[str, str]]]) -> None:
     results: List[Dict[str, Any]] = []
     for max_packets in [256, 512, 1024]:
         for input_window in [10, 20, 30]:
@@ -860,7 +908,7 @@ def run_sweep(base_cfg: CFG, pairs: Sequence[Tuple[str, str]]) -> None:
                         cfg.TEST_RESULT_SAVE_PATH = f"./test_window_predictions_{suffix}.csv"
                         logging.info("Sweep run: %s", suffix)
                         try:
-                            results.append(run_experiment(cfg, pairs, dry_run_data=False))
+                            results.append(run_experiment(cfg, split_pairs, dry_run_data=False))
                         except torch.cuda.OutOfMemoryError:
                             logging.error("Skipping sweep run due to OOM.")
                         except Exception as exc:
@@ -883,6 +931,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stride", type=float)
     p.add_argument("--train-mode", choices=["head", "partial", "full"])
     p.add_argument("--model-path", type=str)
+    p.add_argument("--train-data-dir", type=str)
+    p.add_argument("--val-data-dir", type=str)
+    p.add_argument("--test-data-dir", type=str)
+    p.add_argument("--label-dir", type=str)
     p.add_argument("--fixed-threshold", type=float)
     p.add_argument("--no-val-threshold-search", action="store_true")
     p.add_argument("--debug-max-samples-per-pair", type=int)
@@ -906,6 +958,14 @@ def apply_args(cfg: CFG, args: argparse.Namespace) -> CFG:
         cfg.TRAIN_MODE = args.train_mode
     if args.model_path is not None:
         cfg.MODEL_PATH = args.model_path
+    if args.train_data_dir is not None:
+        cfg.TRAIN_DATA_DIR = args.train_data_dir
+    if args.val_data_dir is not None:
+        cfg.VAL_DATA_DIR = args.val_data_dir
+    if args.test_data_dir is not None:
+        cfg.TEST_DATA_DIR = args.test_data_dir
+    if args.label_dir is not None:
+        cfg.LABEL_DIR = args.label_dir
     if args.fixed_threshold is not None:
         cfg.FIXED_THRESHOLD = args.fixed_threshold
     if args.no_val_threshold_search:
@@ -923,13 +983,13 @@ def main() -> None:
     setup_logging()
     args = parse_args()
     cfg = apply_args(CFG(), args)
-    pairs = scan_pairs(cfg)
+    split_pairs = scan_split_pairs(cfg)
     if not Path(cfg.MODEL_PATH).exists() and not cfg.FORCE_TINY_ENCODER:
         raise FileNotFoundError(f"MODEL_PATH not found: {cfg.MODEL_PATH}")
     if args.sweep:
-        run_sweep(cfg, pairs)
+        run_sweep(cfg, split_pairs)
     else:
-        run_experiment(cfg, pairs, dry_run_data=args.dry_run_data)
+        run_experiment(cfg, split_pairs, dry_run_data=args.dry_run_data)
 
 
 if __name__ == "__main__":
